@@ -74,7 +74,15 @@ def add_finetune_args(parser: ArgumentParser):
     # General arguments
     add_common_args(parser)
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Add tensorboard logger')
-
+    parser.add_argument('--self_train_data', type=bool, default=False,
+                        help='Use Self-Training or not')
+    parser.add_argument('--self_train', type=bool, default=False,
+                        help='Use Self-Training or not')
+    parser.add_argument('--pseudo_thresh', type=float, default=0.9,
+                        help='Self-Training confidence threshold for pseudolabeling')
+    parser.add_argument('--y_thresh', type=float, default=0.5,
+                        help='Self-Training threshold for translating into pseudo-labels')
+                        
     # Data argumenets
     parser.add_argument('--data_path', type=str,
                         help='Path to data CSV file.')

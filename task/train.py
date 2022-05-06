@@ -18,13 +18,15 @@ from torch.utils.data import DataLoader
 
 from grover.data import MolCollator
 from grover.data import StandardScaler
+from grover.data.moldataset import MoleculeDataset, MoleculeDatapoint
 from grover.util.metrics import get_metric_func
 from grover.util.nn_utils import initialize_weights, param_count
 from grover.util.scheduler import NoamLR
 from grover.util.utils import build_optimizer, build_lr_scheduler, makedirs, load_checkpoint, get_loss_func, \
     save_checkpoint, build_model
-from grover.util.utils import get_class_sizes, get_data, split_data, get_task_names
+from grover.util.utils import get_class_sizes, get_data, self_train_split_data, split_data, get_task_names
 from task.predict import predict, evaluate, evaluate_predictions
+
 
 
 
@@ -121,7 +123,7 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
     if args.gpu is not None:
         torch.cuda.set_device(idx)
 
-    features_scaler, scaler, shared_dict, test_data, train_data, val_data = load_data(args, debug, logger)
+    features_scaler, scaler, shared_dict, test_data, train_data, val_data, unlabeled_data = load_data(args, debug, logger)
 
     metric_func = get_metric_func(metric=args.metric)
 
@@ -171,6 +173,7 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         # Bulid data_loader
         shuffle = True
         mol_collator = MolCollator(shared_dict={}, args=args)
+        old_train_data = train_data
         train_data = DataLoader(train_data,
                                 batch_size=args.batch_size,
                                 shuffle=shuffle,
@@ -181,7 +184,13 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         best_score = float('inf') if args.minimize_score else -float('inf')
         best_epoch, n_iter = 0, 0
         min_val_loss = float('inf')
-        for epoch in range(args.epochs):
+
+        if args.self_train == True:
+            train_epochs = args.epochs // 2
+        else:
+            train_epochs = args.epochs
+
+        for epoch in range(train_epochs):
             s_time = time.time()
             n_iter, train_loss = train(
                 epoch=epoch,
@@ -249,6 +258,130 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
 
             if epoch - best_epoch > args.early_stop_epoch:
                 break
+
+        # TODO assign pseudolabels
+        print(args.self_train)
+        if args.self_train == True:
+            pseudolabels, _ = predict(
+                model=model,
+                data=unlabeled_data,
+                loss_func=loss_func,
+                batch_size=args.batch_size,
+                logger=logger,
+                shared_dict=shared_dict,
+                scaler=scaler,
+                args=args
+            )
+            print("\n\n\n\n")
+            print(min(sum(pseudolabels, [])), max(sum(pseudolabels, [])))
+            print("\n\n\n\n")
+            thresh = args.pseudo_thresh
+            certain_inds = []
+            for i in range(len(pseudolabels)):
+                pr = pseudolabels[i][0] 
+                if (1 - pr) > thresh or pr > thresh:
+                    certain_inds += [i]
+            
+            print(len(certain_inds), len(pseudolabels))
+            
+            comb_data = old_train_data.data
+            num_targets = len(pseudolabels[0])
+            for i in certain_inds:
+                # Combine known x with pseudolabel y
+                line = [unlabeled_data.data[i].line[0]] + [0 if pseudolabels[i][j] < args.y_thresh else 1 for j in range(num_targets)]
+                comb_data += [
+                        MoleculeDatapoint(
+                            line,
+                            unlabeled_data.data[i].args,
+                            unlabeled_data.data[i].features,
+                            unlabeled_data.data[i].use_compound_names
+                        )  
+                    ] 
+                # TODO pseudo-label accuracy
+            comb_data = MoleculeDataset(comb_data)
+            # TODO retrain with pseudolabels
+
+            train_data = DataLoader(comb_data,
+                                batch_size=args.batch_size,
+                                shuffle=shuffle,
+                                num_workers=10,
+                                collate_fn=mol_collator)
+
+            # Run training
+            best_score = float('inf') if args.minimize_score else -float('inf')
+            best_epoch, n_iter = 0, 0
+            min_val_loss = float('inf')
+            for epoch in range(train_epochs):
+                s_time = time.time()
+                n_iter, train_loss = train(
+                    epoch=epoch,
+                    model=model,
+                    data=train_data,
+                    loss_func=loss_func,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                    n_iter=n_iter,
+                    shared_dict=shared_dict,
+                    logger=logger
+                )
+                t_time = time.time() - s_time
+                s_time = time.time()
+                val_scores, val_loss = evaluate(
+                    model=model,
+                    data=val_data,
+                    loss_func=loss_func,
+                    num_tasks=args.num_tasks,
+                    metric_func=metric_func,
+                    batch_size=args.batch_size,
+                    dataset_type=args.dataset_type,
+                    scaler=scaler,
+                    shared_dict=shared_dict,
+                    logger=logger,
+                    args=args
+                )
+                v_time = time.time() - s_time
+                # Average validation score
+                avg_val_score = np.nanmean(val_scores)
+                # Logged after lr step
+                if isinstance(scheduler, ExponentialLR):
+                    scheduler.step()
+
+                if args.show_individual_scores:
+                    # Individual validation scores
+                    for task_name, val_score in zip(args.task_names, val_scores):
+                        debug(f'Validation {task_name} {args.metric} = {val_score:.6f}')
+                print('Epoch: {:04d}'.format(epoch),
+                    'loss_train: {:.6f}'.format(train_loss),
+                    'loss_val: {:.6f}'.format(val_loss),
+                    f'{args.metric}_val: {avg_val_score:.4f}',
+                    # 'auc_val: {:.4f}'.format(avg_val_score),
+                    'cur_lr: {:.5f}'.format(scheduler.get_lr()[-1]),
+                    't_time: {:.4f}s'.format(t_time),
+                    'v_time: {:.4f}s'.format(v_time))
+
+                if args.tensorboard:
+                    writer.add_scalar('loss/train', train_loss, epoch)
+                    writer.add_scalar('loss/val', val_loss, epoch)
+                    writer.add_scalar(f'{args.metric}_val', avg_val_score, epoch)
+
+
+                # Save model checkpoint if improved validation score
+                if args.select_by_loss:
+                    if val_loss < min_val_loss:
+                        min_val_loss, best_epoch = val_loss, epoch
+                        save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+                else:
+                    if args.minimize_score and avg_val_score < best_score or \
+                            not args.minimize_score and avg_val_score > best_score:
+                        best_score, best_epoch = avg_val_score, epoch
+                        save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+
+                if epoch - best_epoch > args.early_stop_epoch:
+                    break
+
+
+
 
         ensemble_scores = 0.0
 
@@ -329,6 +462,7 @@ def load_data(args, debug, logger):
     :param logger:
     :return:
     """
+    unlabeled_data = None
     # Get data
     debug('Loading data')
     args.task_names = get_task_names(args.data_path)
@@ -357,6 +491,9 @@ def load_data(args, debug, logger):
     elif args.separate_test_path:
         train_data, val_data, _ = split_data(data=data, split_type=args.split_type,
                                              sizes=(0.8, 0.2, 0.0), seed=args.seed, args=args, logger=logger)
+    elif args.self_train_data is True:
+        train_data, val_data, test_data, unlabeled_data = self_train_split_data(data=data, split_type=args.split_type,
+                                                     sizes=args.split_sizes, seed=args.seed, args=args, logger=logger)
     else:
         train_data, val_data, test_data = split_data(data=data, split_type=args.split_type,
                                                      sizes=args.split_sizes, seed=args.seed, args=args, logger=logger)
@@ -393,7 +530,7 @@ def load_data(args, debug, logger):
         val_data.set_targets(scaled_val_targets)
     else:
         scaler = None
-    return features_scaler, scaler, shared_dict, test_data, train_data, val_data
+    return features_scaler, scaler, shared_dict, test_data, train_data, val_data, unlabeled_data
 
 
 def save_splits(args, test_data, train_data, val_data):

@@ -31,6 +31,9 @@ class MoleculeDatapoint:
         :param features: A numpy array containing additional features (ex. Morgan fingerprint).
         :param use_compound_names: Whether the data CSV includes the compound name on each line.
         """
+        self.line = line
+        self.use_compound_names = use_compound_names
+        
         self.features_generator = None
         self.args = None
         if args is not None:

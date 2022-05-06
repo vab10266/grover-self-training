@@ -244,6 +244,26 @@ def get_data_from_smiles(smiles: List[str], skip_invalid_smiles: bool = True, lo
 
     return data
 
+def self_train_split_data(data, split_type, sizes, seed, args, logger):
+    print("self_train_split_data")
+    assert len(sizes) == 3 and sum(sizes) <= 1
+    for x in sizes:
+        assert x >= 0
+    assert split_type == 'random'
+    if split_type == 'random':
+        data.shuffle(seed=seed)
+
+        train_size = int(sizes[0] * len(data))
+        train_val_size = int((sizes[0] + sizes[1]) * len(data))
+        train_val_test_size = int((sizes[0] + sizes[1] + sizes[2]) * len(data))
+
+        train = data[:train_size]
+        val = data[train_size:train_val_size]
+        test = data[train_val_size:train_val_test_size]
+        unlabeled = data[train_val_test_size:]
+
+        return MoleculeDataset(train), MoleculeDataset(val), MoleculeDataset(test), MoleculeDataset(unlabeled)
+    
 
 def split_data(data: MoleculeDataset,
                split_type: str = 'random',
